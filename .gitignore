@@ -1,7 +1,10 @@
-# Environment variables
+# Ignore local env files
 .env
-New_Tech_project/QUICKSTART.md
-New_Tech_project/DEPLOYMENT.md
+.env.*
+
+# Ignore these documentation files from the repo (treated like secrets)
+DEPLOYMENT.md
+QUICKSTART.md
 
 # Python
 __pycache__/
