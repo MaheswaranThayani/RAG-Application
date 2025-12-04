@@ -1,13 +1,13 @@
 # 📄 PDF Question Answering Bot
 
-A Retrieval-Augmented Generation (RAG) based PDF Question Answering application built using Python, LangChain, Streamlit, FAISS, and OpenAI/HuggingFace. This application allows users to upload PDF documents and ask questions, with the system retrieving relevant chunks using embeddings and generating accurate answers using Large Language Models (LLMs).
+A Retrieval-Augmented Generation (RAG) based PDF Question Answering application built using Python, LangChain, Streamlit, FAISS, and **local HuggingFace models**. This application allows users to upload PDF documents and ask questions, with the system retrieving relevant chunks using embeddings and generating accurate answers **only from the uploaded PDF content**.
 
 ## ✨ Features
 
 - 📤 **PDF Upload**: Easy drag-and-drop interface for uploading PDF documents
 - 🔍 **Intelligent Text Extraction**: Extracts text from PDF pages using PyPDF2
 - 🧠 **Smart Chunking**: Uses RecursiveCharacterTextSplitter for optimal text segmentation
-- 🔢 **Vector Embeddings**: Supports both OpenAI and HuggingFace embeddings
+- 🔢 **Vector Embeddings**: Uses HuggingFace sentence-transformer embeddings
 - 💾 **Vector Store**: FAISS for efficient similarity search
 - 💬 **Interactive Q&A**: Chat-like interface for asking questions
 - 📌 **Source Citations**: Shows source documents for each answer
@@ -22,15 +22,15 @@ A Retrieval-Augmented Generation (RAG) based PDF Question Answering application 
 | LLM Framework | LangChain |
 | Text Extraction | PyPDF2 |
 | Text Splitting | LangChain RecursiveCharacterTextSplitter |
-| Embeddings | OpenAI Embeddings / HuggingFace Sentence Transformers |
+| Embeddings | HuggingFace Sentence Transformers |
 | Vector Store | FAISS |
-| Language Model | OpenAI GPT (with HuggingFace fallback option) |
+| Language Model | Local HuggingFace text2text model (`google/flan-t5-small` by default) |
 
 ## 📋 Prerequisites
 
-- Python 3.8 or higher
-- OpenAI API key (optional - can use HuggingFace for embeddings)
+- Python 3.9 or higher
 - pip package manager
+- A machine that can download and run a small HuggingFace model (the first run will download `google/flan-t5-small`)
 
 ## 🚀 Installation
 
@@ -59,20 +59,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Step 4: Set Up Environment Variables
+### Step 4: (Optional) Environment Variables
 
-1. Copy the example environment file:
-```bash
-copy .env.example .env  # Windows
-cp .env.example .env    # macOS/Linux
-```
-
-2. Edit `.env` and add your OpenAI API key:
-```
-OPENAI_API_KEY=your_actual_api_key_here
-```
-
-**Note**: You can get your OpenAI API key from [https://platform.openai.com/api-keys](https://platform.openai.com/api-keys)
+For the current local-only HuggingFace setup **no API keys are required**.
+You can still use a `.env` file for future extensions, but it is not needed to run this version.
 
 ## 🎯 Usage
 
@@ -114,26 +104,23 @@ New_Tech_project/
 
 ## 🔧 Configuration Options
 
-### Using OpenAI (Default)
+The app currently runs **entirely with local HuggingFace models**:
 
-The application uses OpenAI embeddings and GPT models by default. Ensure you have set `OPENAI_API_KEY` in your `.env` file.
+- Embeddings: `sentence-transformers/all-MiniLM-L6-v2`
+- Generator: `google/flan-t5-small` (loaded via `transformers` pipeline)
 
-### Using HuggingFace (Free Alternative)
-
-1. Uncheck "Use OpenAI" in the sidebar
-2. The app will use HuggingFace's `sentence-transformers/all-MiniLM-L6-v2` for embeddings
-3. Note: You'll still need OpenAI API key for answer generation, or you can modify the code to use HuggingFace Hub models
+If you want to switch to a different local model, change the model name passed to `load_local_hf_pipeline` in `app.py`.
 
 ## 🧠 How It Works
 
 1. **PDF Upload**: User uploads a PDF document through Streamlit interface
 2. **Text Extraction**: PyPDF2 extracts text from all pages of the PDF
 3. **Text Chunking**: RecursiveCharacterTextSplitter divides text into overlapping chunks (1000 chars with 200 char overlap)
-4. **Embedding Generation**: Each chunk is converted to a vector using embeddings (OpenAI or HuggingFace)
+4. **Embedding Generation**: Each chunk is converted to a vector using HuggingFace embeddings
 5. **Vector Storage**: FAISS stores all chunk embeddings for efficient similarity search
 6. **Question Processing**: User's question is embedded using the same embedding model
 7. **Retrieval**: FAISS finds the top-k most similar chunks to the question
-8. **Answer Generation**: LangChain's RetrievalQA chain uses the retrieved chunks as context and generates an answer using the LLM
+8. **Answer Generation**: A local HuggingFace pipeline receives the top chunks as context and generates an answer using **only that context**
 9. **Response Display**: Answer and source documents are displayed to the user
 
 ## 📊 Features Breakdown

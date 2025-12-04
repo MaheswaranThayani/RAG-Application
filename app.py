@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 import tempfile
 import importlib.util
-from typing import Any, Dict
+from typing import Any
 from PyPDF2 import PdfReader
 
 # Core imports (always needed)
@@ -28,41 +28,22 @@ if lc_chains_spec:
 else:
     HAS_RETRIEVALQA = False
 
-# Lightweight wrapper for HuggingFace text-generation inference
-class HuggingFaceLLM:
-    def __init__(
-        self,
-        repo_id: str,
-        *,
-        token: str,
-        temperature: float = 0.2,
-        max_new_tokens: int = 512,
-        top_p: float = 0.95,
-    ) -> None:
-        from huggingface_hub import InferenceClient
+# Force manual QA path to ensure compatibility with local HuggingFace pipeline
+HAS_RETRIEVALQA = False
 
-        self.client = InferenceClient(model=repo_id, token=token)
-        self.params: Dict[str, Any] = {
-            "temperature": temperature,
-            "max_new_tokens": max_new_tokens,
-            "top_p": top_p,
-        }
+# Legacy alias kept for compatibility with older references/lints
+class HuggingFaceLLM:  # pragma: no cover - kept for tooling compatibility
+    ...
 
-    def invoke(self, prompt: str) -> str:
-        # Use chat_completion for instruct/chat models (conversational task)
-        # Format: messages list with role and content
-        messages = [{"role": "user", "content": prompt}]
-        response = self.client.chat_completion(
-            messages=messages,
-            **self.params
-        )
-        # Extract text from response
-        if hasattr(response, "choices") and len(response.choices) > 0:
-            return response.choices[0].message.content
-        elif isinstance(response, dict) and "choices" in response:
-            return response["choices"][0]["message"]["content"]
-        else:
-            return str(response)
+# Cached local HuggingFace pipeline (avoids remote API limits)
+@st.cache_resource(show_spinner=False)
+def load_local_hf_pipeline(model_name: str = "google/flan-t5-small"):
+    """Load a local HuggingFace text2text pipeline to stay within PDF context."""
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    return pipeline("text2text-generation", model=model, tokenizer=tokenizer)
 
 
 # Load environment variables
@@ -172,23 +153,8 @@ with col1:
                             model_name="sentence-transformers/all-MiniLM-L6-v2"
                         )
                         
-                        # Configure HuggingFace LLM (requires HUGGINGFACEHUB_API_TOKEN)
-                        hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-                        if not hf_token:
-                            st.error(
-                                "⚠️ HUGGINGFACEHUB_API_TOKEN is not set. "
-                                "Please add it to your .env file to use the HuggingFace LLM."
-                            )
-                            st.stop()
-                        
-                        # You can change `repo_id` to any chat/instruct model available to you
-                        llm = HuggingFaceLLM(
-                            repo_id="mistralai/Mistral-7B-Instruct-v0.2",
-                            token=hf_token,
-                            temperature=0.2,
-                            max_new_tokens=512,
-                            top_p=0.95,
-                        )
+                        # Configure local HuggingFace pipeline (no external API calls)
+                        llm = load_local_hf_pipeline("google/flan-t5-small")
                         
                         vector_store = FAISS.from_texts(chunks, embedding=embeddings)
                         
@@ -239,7 +205,7 @@ with col2:
     
     if st.session_state.pdf_processed:
         if st.session_state.qa_chain is None:
-            st.warning("PDF was processed using HuggingFace embeddings only. No LLM is configured for answering questions, so Q&A is disabled until you enable OpenAI or add another LLM.")
+            st.warning("PDF was processed, but the language model is not ready yet. Please reprocess the PDF or restart the app.")
             st.stop()
         # Clear chat button
         if st.button("🗑️ Clear Chat History"):
@@ -270,33 +236,26 @@ with col2:
             with st.chat_message("assistant"):
                 with st.spinner("🤔 Thinking..."):
                     try:
-                        if HAS_RETRIEVALQA:
-                            # Use RetrievalQA chain
-                            result = st.session_state.qa_chain({"query": query})
-                            answer = result["result"]
-                            source_docs = result.get("source_documents", [])
-                            sources_text = [doc.page_content for doc in source_docs] if source_docs else []
+                        # Simple approach: retrieve and generate using local pipeline
+                        qa_data = st.session_state.qa_chain
+                        retriever = qa_data["retriever"]
+                        llm = qa_data["llm"]
+                        
+                        # Retrieve relevant documents (support modern retriever API)
+                        if hasattr(retriever, "get_relevant_documents"):
+                            docs = retriever.get_relevant_documents(query)
+                        elif hasattr(retriever, "invoke"):
+                            docs = retriever.invoke(query)
                         else:
-                            # Simple approach: retrieve and generate
-                            qa_data = st.session_state.qa_chain
-                            retriever = qa_data["retriever"]
-                            llm = qa_data["llm"]
-                            
-                            # Retrieve relevant documents (support modern retriever API)
-                            if hasattr(retriever, "get_relevant_documents"):
-                                docs = retriever.get_relevant_documents(query)
-                            elif hasattr(retriever, "invoke"):
-                                docs = retriever.invoke(query)
-                            else:
-                                raise AttributeError(
-                                    "Retriever object does not support document lookup."
-                                )
-                            
-                            # Create context from documents
-                            context = "\n\n".join([doc.page_content for doc in docs])
-                            
-                            # Generate answer using LLM
-                            prompt = f"""Answer the following question based only on the provided context. If the answer cannot be found in the context, say "I don't have enough information to answer this question."
+                            raise AttributeError(
+                                "Retriever object does not support document lookup."
+                            )
+                        
+                        # Create context from documents
+                        context = "\n\n".join([doc.page_content for doc in docs])
+                        
+                        # Generate answer using local HuggingFace pipeline
+                        prompt = f"""Answer the following question using ONLY the context below. If the answer is not in the context, reply with "I don't have enough information to answer this question."
 
 Context:
 {context}
@@ -304,10 +263,14 @@ Context:
 Question: {query}
 
 Answer:"""
-                            
-                            llm_response = llm.invoke(prompt)
-                            answer = llm_response.content if hasattr(llm_response, "content") else str(llm_response)
-                            sources_text = [doc.page_content for doc in docs] if docs else []
+                        
+                        llm_output = llm(
+                            prompt,
+                            max_new_tokens=256,
+                            do_sample=False,
+                        )
+                        answer = llm_output[0]["generated_text"].strip() if llm_output else "I couldn't generate an answer."
+                        sources_text = [doc.page_content for doc in docs] if docs else []
                         
                         st.markdown(answer)
                         
@@ -344,7 +307,7 @@ st.markdown("---")
 st.markdown(
     """
     <div style='text-align: center; color: gray;'>
-    <p>Built with ❤️ using Streamlit, LangChain, FAISS, and OpenAI</p>
+    <p>Built with ❤️ using Streamlit, LangChain, FAISS, and HuggingFace</p>
     </div>
     """,
     unsafe_allow_html=True
