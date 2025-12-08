@@ -3,10 +3,11 @@ import os
 from dotenv import load_dotenv
 import tempfile
 import importlib.util
-from typing import Any
+from typing import Any, List, Tuple
 from PyPDF2 import PdfReader
 import re
 import html
+import numpy as np
 
 # Core imports (always needed)
 try:
@@ -64,77 +65,96 @@ def highlight_relevant_sentence(source_text: str, answer_text: str) -> str:
     return " ".join(highlighted_sentences)
 
 
-def question_has_overlap_with_context(question: str, context: str) -> bool:
-    """Heuristic: check if any important word from the question appears in the
-    retrieved context. This helps avoid answering about Sri Lanka when the
-    user asks about India, etc.
-
-    We ignore very short/common words and only keep keywords of length >= 4
-    that are not typical stopwords.
-    """
-    if not question or not context:
-        return False
-
-    context_lower = context.lower()
-    context_compact = context_lower.replace(" ", "")  # for matching without spaces
-    words = re.findall(r"\w+", question.lower())
-    stopwords = {
-        "what", "when", "where", "who", "whom", "which", "why", "how",
-        "is", "are", "was", "were", "be", "been", "being",
-        "the", "a", "an", "of", "in", "on", "at", "for", "to",
-        "and", "or", "if", "then", "else", "do", "does", "did",
-        "from", "about", "this", "that", "these", "those", "with",
-    }
-
-    keywords = [w for w in words if len(w) >= 4 and w not in stopwords]
-    if not keywords:
-        return False
-
-    # Be conservative: require that *all* important keywords appear in the
-    # retrieved context. For example, for "independent day of India" we
-    # require that something like "india" also appears, so we don't answer
-    # from Sri Lanka paragraphs.
-    #
-    # To handle minor formatting differences such as missing spaces
-    # ("srilanka" vs "sri lanka"), we also compare against a space-free
-    # version of the context.
-    for k in keywords:
-        k_lower = k.lower()
-        k_compact = k_lower.replace(" ", "")
-        if k_lower not in context_lower and k_compact not in context_compact:
-            return False
-    return True
-
-
-def context_has_sentence_with_all_keywords(question: str, context: str) -> bool:
-    """Stricter check: is there at least one sentence in the context that
-    contains all important keywords from the question?
-
-    This helps cases like 'independence day of India' where 'India' might
-    appear somewhere in the PDF, but never in the same sentence as the
-    other important words.
-    """
-    if not question or not context:
-        return False
-
-    sentences = re.split(r"(?<=[.!?])\s+", context)
-    words = re.findall(r"\w+", question.lower())
-    stopwords = {
-        "what", "when", "where", "who", "whom", "which", "why", "how",
-        "is", "are", "was", "were", "be", "been", "being",
-        "the", "a", "an", "of", "in", "on", "at", "for", "to",
-        "and", "or", "if", "then", "else", "do", "does", "did",
-        "from", "about", "this", "that", "these", "those", "with",
-    }
-    keywords = [w for w in words if len(w) >= 4 and w not in stopwords]
-    if not keywords:
-        return False
-
-    for s in sentences:
-        s_lower = s.lower()
-        if all(k.lower() in s_lower for k in keywords):
+def is_followup_question(query: str) -> bool:
+    """Detect if query is a vague follow-up that needs context."""
+    vague_patterns = [
+        r"^what\s+(are|is|were|was)\s+(they|it|those|these|that|this)\??$",
+        r"^(tell|explain|describe|list)\s+(me\s+)?(more|them|it|those|these)\??$",
+        r"^(and|also|what about)\s+(the\s+)?(others?|rest|more)\??$",
+        r"^(can you|please)\s+(explain|list|tell)\s+(them|it|more)\??$",
+        r"^(how|why|when|where)\??$",
+        r"^(yes|no|okay|go on|continue)\??$",
+    ]
+    q = query.strip().lower()
+    for pattern in vague_patterns:
+        if re.match(pattern, q):
             return True
+    words = q.split()
+    if len(words) <= 4 and any(w in ["they", "it", "them", "those", "these", "that", "this"] for w in words):
+        return True
     return False
+
+
+def expand_with_context(query: str, messages: List[dict]) -> str:
+    """Expand vague follow-up with previous Q&A context."""
+    if not messages or not is_followup_question(query):
+        return query
+    
+    last_qa = []
+    for msg in reversed(messages[-4:]):
+        if msg["role"] == "user":
+            last_qa.insert(0, f"Q: {msg['content']}")
+        elif msg["role"] == "assistant" and "sources" in msg:
+            last_qa.insert(0, f"A: {msg['content']}")
+    
+    if last_qa:
+        context_str = " ".join(last_qa)
+        return f"{context_str} {query}"
+    return query
+
+
+def compute_semantic_similarity(text1: str, text2: str, embeddings_model) -> float:
+    """Compute cosine similarity between two texts using embeddings."""
+    try:
+        emb1 = embeddings_model.embed_query(text1)
+        emb2 = embeddings_model.embed_query(text2)
+        emb1 = np.array(emb1)
+        emb2 = np.array(emb2)
+        similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+        return float(similarity)
+    except Exception:
+        return 0.0
+
+
+def compute_max_chunk_similarity(query: str, docs: list, embeddings_model) -> float:
+    """Compute max similarity between query and individual document chunks."""
+    if not docs or not embeddings_model:
+        return 0.0
+    try:
+        query_emb = np.array(embeddings_model.embed_query(query))
+        max_sim = 0.0
+        for doc in docs:
+            chunk_emb = np.array(embeddings_model.embed_query(doc.page_content))
+            sim = np.dot(query_emb, chunk_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(chunk_emb))
+            max_sim = max(max_sim, float(sim))
+        return max_sim
+    except Exception:
+        return 0.0
+
+
+def validate_answer_grounding(answer: str, context: str, embeddings_model=None) -> Tuple[bool, float]:
+    """Validate that the answer is grounded in the context.
+    Uses PURE semantic similarity - no keyword matching.
+    Returns (is_grounded, score).
+    """
+    if not answer or not context:
+        return False, 0.0
+    
+    # Short answers are usually extracted directly - trust them
+    if len(answer.split()) <= 15:
+        return True, 1.0
+    
+    # Pure semantic check
+    if embeddings_model:
+        try:
+            semantic_score = compute_semantic_similarity(answer, context, embeddings_model)
+            is_grounded = semantic_score >= 0.4
+            return is_grounded, semantic_score
+        except Exception:
+            pass
+    
+    # Fallback: if no embeddings, trust the answer
+    return True, 1.0
 
 
 # Cached local HuggingFace pipeline (avoids remote API limits)
@@ -167,6 +187,8 @@ if "qa_chain" not in st.session_state:
     st.session_state.qa_chain = None
 if "pdf_processed" not in st.session_state:
     st.session_state.pdf_processed = False
+if "embeddings_model" not in st.session_state:
+    st.session_state.embeddings_model = None
 
 # Custom CSS for better UI
 st.markdown("""
@@ -298,9 +320,10 @@ with col_upload:
                         embeddings = HuggingFaceEmbeddings(
                             model_name="sentence-transformers/all-MiniLM-L6-v2"
                         )
+                        st.session_state.embeddings_model = embeddings
 
                         # Configure local HuggingFace pipeline (no external API calls)
-                        llm = load_local_hf_pipeline("google/flan-t5-small")
+                        llm = load_local_hf_pipeline("google/flan-t5-base")
 
                         vector_store = FAISS.from_texts(chunks, embedding=embeddings)
 
@@ -423,11 +446,15 @@ with col_chat:
                 retriever = qa_data["retriever"]
                 llm = qa_data["llm"]
 
+                # Expand vague follow-up questions with conversation context
+                expanded_query = expand_with_context(query, st.session_state.messages)
+                search_query = expanded_query if expanded_query != query else query
+
                 # Retrieve relevant documents (support modern retriever API)
                 if hasattr(retriever, "get_relevant_documents"):
-                    docs = retriever.get_relevant_documents(query)
+                    docs = retriever.get_relevant_documents(search_query)
                 elif hasattr(retriever, "invoke"):
-                    docs = retriever.invoke(query)
+                    docs = retriever.invoke(search_query)
                 else:
                     raise AttributeError(
                         "Retriever object does not support document lookup."
@@ -436,37 +463,85 @@ with col_chat:
                 # Build full context from retrieved chunks
                 context = "\n\n".join([doc.page_content for doc in docs]) if docs else ""
 
-                # Relevance gate: only answer when
-                #  - there is non-empty context, AND
-                #  - all important keywords appear somewhere in the context, AND
-                #  - at least one sentence in the context contains all
-                #    important keywords together.
-                is_relevant = (
-                    bool(context.strip())
-                    and question_has_overlap_with_context(query, context)
-                    and context_has_sentence_with_all_keywords(query, context)
-                )
+                # Semantic Similarity Check - use max chunk similarity for better accuracy
+                semantic_score = 0.0
+                if docs and st.session_state.embeddings_model:
+                    semantic_score = compute_max_chunk_similarity(
+                        search_query, docs, st.session_state.embeddings_model
+                    )
+                
+                # Threshold 0.35 for individual chunk matching (more reliable than full context)
+                SEMANTIC_THRESHOLD = 0.35
+                is_relevant = bool(context.strip()) and semantic_score >= SEMANTIC_THRESHOLD
+
+                # Debug info in sidebar
+                with st.sidebar:
+                    if search_query != query:
+                        st.write(f"🔗 Expanded: {search_query[:60]}...")
+                    st.write(f"🔍 Max Chunk Score: {semantic_score:.3f}")
+                    st.write(f"📊 Threshold: {SEMANTIC_THRESHOLD}")
+                    st.write(f"✅ Relevant: {is_relevant}")
 
                 if not is_relevant:
-                    answer = "There is no proper answer for this question in your PDF. It may be about a topic that is not covered."
+                    if not context.strip():
+                        answer = "No relevant content found in the PDF. Please try rephrasing your question."
+                    else:
+                        answer = f"The question doesn't seem related to the PDF content (score: {semantic_score:.2f}). Try asking something more specific to the document."
                     sources_text = []
                 else:
-                    # Generate answer using local HuggingFace pipeline
-                    prompt = f"""Answer the following question using ONLY the context below. If the answer is not in the context, reply with "I don't have enough information to answer this question."
+                    # Use expanded query for better context in follow-up questions
+                    question_for_llm = search_query if search_query != query else query
+                    
+                    # Build conversation history for context
+                    chat_history = ""
+                    recent_msgs = st.session_state.messages[-6:]  # Last 3 Q&A pairs
+                    for msg in recent_msgs:
+                        if msg["role"] == "user":
+                            chat_history += f"User: {msg['content']}\n"
+                        elif msg["role"] == "assistant":
+                            chat_history += f"Assistant: {msg['content']}\n"
+                    
+                    # System prompt for consistent behavior
+                    system_prompt = """You are a precise document assistant. Your rules:
+1. Answer ONLY using information from the provided context
+2. If asked "what are they" or similar, list ALL items mentioned for that topic
+3. Be specific and complete - list all relevant details
+4. If information is not in context, say "I don't have that information"
+5. Never make up facts or use external knowledge"""
 
-Context:
+                    prompt = f"""{system_prompt}
+
+{f"Previous conversation:{chr(10)}{chat_history}" if chat_history else ""}
+
+Context from document:
 {context}
 
-Question: {query}
+Current question: {question_for_llm}
 
 Answer:"""
 
                     llm_output = llm(
                         prompt,
-                        max_new_tokens=256,
+                        max_new_tokens=300,
                         do_sample=False,
                     )
-                    answer = llm_output[0]["generated_text"].strip() if llm_output else "I couldn't generate an answer."
+                    raw_answer = llm_output[0]["generated_text"].strip() if llm_output else ""
+                    
+                    # Step 3: Post-generation validation - check answer is grounded
+                    is_grounded, grounding_score = validate_answer_grounding(
+                        raw_answer, context, st.session_state.embeddings_model
+                    )
+                    
+                    # Debug grounding in sidebar
+                    with st.sidebar:
+                        st.write(f"📎 Grounding Score: {grounding_score:.3f}")
+                        st.write(f"✅ Grounded: {is_grounded}")
+                    
+                    if not raw_answer or not is_grounded:
+                        answer = "I couldn't find a reliable answer in the PDF for this question."
+                    else:
+                        answer = raw_answer
+                    
                     sources_text = [doc.page_content for doc in docs] if docs else []
 
                 # Update chat history (user question + assistant answer)
@@ -478,16 +553,14 @@ Answer:"""
                 })
 
             except Exception as e:
-                import traceback
-                error_msg = f"❌ Error generating answer: {str(e)}"
+                error_msg = "❌ An error occurred while processing your question. Please try again."
+                st.session_state.messages.append({
+                    "role": "user",
+                    "content": query,
+                })
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": error_msg,
-                })
-                # Optionally log traceback for debugging in the UI
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": traceback.format_exc(),
                 })
 
             # Rerun so that the updated history is rendered above and the input
