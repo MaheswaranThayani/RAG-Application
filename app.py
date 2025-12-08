@@ -12,6 +12,19 @@ from sentence_transformers import SentenceTransformer, util
 import torch
 import textdistance
 
+import nltk
+from nltk.corpus import stopwords
+
+# Download stopwords if not already present
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
+
+# Load English stopwords set
+EN_STOPWORDS = set(stopwords.words('english'))
+
+
 # Core imports (always needed)
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -196,13 +209,8 @@ def question_has_overlap_with_context(question: str, context: str, vocabulary: s
     context_lower = context.lower()
     context_compact = context_lower.replace(" ", "")  # for matching without spaces
     words = re.findall(r"\w+", question.lower())
-    stopwords = {
-        "what", "when", "where", "who", "whom", "which", "why", "how",
-        "is", "are", "was", "were", "be", "been", "being",
-        "the", "a", "an", "of", "in", "on", "at", "for", "to",
-        "and", "or", "if", "then", "else", "do", "does", "did",
-        "from", "about", "this", "that", "these", "those", "with",
-    }
+    stopwords = EN_STOPWORDS
+
 
     keywords = [w for w in words if len(w) >= 4 and w not in stopwords]
     if not keywords:
@@ -265,13 +273,8 @@ def context_has_sentence_with_all_keywords(question: str, context: str, vocabula
 
     sentences = re.split(r"(?<=[.!?])\s+", context)
     words = re.findall(r"\w+", question.lower())
-    stopwords = {
-        "what", "when", "where", "who", "whom", "which", "why", "how",
-        "is", "are", "was", "were", "be", "been", "being",
-        "the", "a", "an", "of", "in", "on", "at", "for", "to",
-        "and", "or", "if", "then", "else", "do", "does", "did",
-        "from", "about", "this", "that", "these", "those", "with",
-    }
+    stopwords = EN_STOPWORDS
+
     keywords = [w for w in words if len(w) >= 4 and w not in stopwords]
     if not keywords:
         return False
@@ -657,10 +660,39 @@ Answer:"""
 
                     llm_output = llm(
                         prompt,
-                        max_new_tokens=256,
-                        do_sample=False,
+                        max_new_tokens=80,      # Further reduced to prevent long repetitive outputs
+                        do_sample=True,         # Enable sampling for variety
+                        temperature=0.8,         # Higher temperature for more creativity
+                        top_p=0.9,             # Nucleus sampling to avoid repetitive tokens
+                        repetition_penalty=1.2, # Penalize repeating tokens/phrases
+                        no_repeat_ngram_size=3, # Prevent repeating 3-gram sequences
                     )
-                    answer = llm_output[0]["generated_text"].strip() if llm_output else "I couldn't generate an answer."
+                    # Extract only the generated answer, not the full prompt+answer
+                    full_text = llm_output[0]["generated_text"] if llm_output else ""
+                    # Remove the prompt from the beginning to get only the answer
+                    if full_text.startswith(prompt):
+                        answer = full_text[len(prompt):].strip()
+                    else:
+                        # Alternative: split on "Answer:" and take the part after it
+                        answer = full_text.split("Answer:")[-1].strip() if "Answer:" in full_text else full_text.strip()
+                    
+                    # Post-process to remove repeated sentences
+                    if answer:
+                        sentences = answer.split('. ')
+                        unique_sentences = []
+                        seen = set()
+                        for sentence in sentences:
+                            sentence = sentence.strip()
+                            if sentence and sentence not in seen:
+                                seen.add(sentence)
+                                unique_sentences.append(sentence)
+                        answer = '. '.join(unique_sentences)
+                        if answer and not answer.endswith('.'):
+                            answer += '.'
+                    
+                    # If answer is empty after processing, provide fallback
+                    if not answer:
+                        answer = "I couldn't generate a proper answer from the context."
                     sources_text = [doc.page_content for doc in docs] if docs else []
 
                 # Update chat history (user question + assistant answer)
