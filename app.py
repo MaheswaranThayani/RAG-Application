@@ -25,15 +25,15 @@ except LookupError:
 EN_STOPWORDS = set(stopwords.words('english'))
 
 
-# Core imports (always needed)
+# Core imports 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain_community.vectorstores import FAISS
+    from langchain_community.vectorstores import Chroma
     USE_MODERN_LANGCHAIN = True
 except ImportError:
     # Fallback to older version
     from langchain.text_splitter import RecursiveCharacterTextSplitter  # pyright: ignore[reportMissingImports]
-    from langchain.vectorstores import FAISS  # pyright: ignore[reportMissingImports]
+    from langchain.vectorstores import Chroma  # pyright: ignore[reportMissingImports]
     USE_MODERN_LANGCHAIN = False
 
 # Try to import RetrievalQA without raising module-level errors on Streamlit Cloud
@@ -81,7 +81,7 @@ def highlight_relevant_sentence(source_text: str, answer_text: str) -> str:
     return " ".join(highlighted_sentences)
 
 
-def split_into_chunks(text: str, chunk_size: int = 300, overlap: int = 50) -> List[str]:
+def split_into_chunks(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
     """Split text into smaller chunks with overlap."""
     words = text.split()
     chunks = []
@@ -489,7 +489,14 @@ with col_upload:
                         # Configure local HuggingFace pipeline (no external API calls)
                         llm = load_local_hf_pipeline("google/flan-t5-small")
 
-                        vector_store = FAISS.from_texts(chunks, embedding=embeddings)
+                        # Create ChromaDB vector store with persistent storage
+                        import tempfile
+                        persist_directory = tempfile.mkdtemp()
+                        vector_store = Chroma.from_texts(
+                            texts=chunks,
+                            embedding=embeddings,
+                            persist_directory=persist_directory
+                        )
 
                         # Create QA chain (only if an LLM is configured)
                         retriever = vector_store.as_retriever(search_kwargs={"k": 3})
@@ -630,6 +637,14 @@ with col_chat:
                         "Retriever object does not support document lookup."
                     )
 
+                # Build conversational history for context
+                history_text = ""
+                for chat in st.session_state.messages:
+                    if chat["role"] == "user":
+                        history_text += f"User: {chat['content']}\n"
+                    elif chat["role"] == "assistant":
+                        history_text += f"Assistant: {chat['content']}\n"
+
                 # Build full context from retrieved chunks
                 context = "\n\n".join([doc.page_content for doc in docs]) if docs else ""
 
@@ -650,6 +665,9 @@ with col_chat:
                 else:
                     # Generate answer using local HuggingFace pipeline
                     prompt = f"""Answer the following question using ONLY the context below. If the answer is not in the context, reply with "I don't have enough information to answer this question."
+
+Conversation History:
+{history_text}
 
 Context:
 {context}
@@ -729,7 +747,7 @@ Answer:"""
 st.markdown(
     """
     <div class='chat-footer-note'>
-      Built with ❤️ using Streamlit, LangChain, FAISS, and HuggingFace
+      Built with ❤️ using Streamlit, LangChain, ChromoDB, and HuggingFace
     </div>
     """,
     unsafe_allow_html=True,
