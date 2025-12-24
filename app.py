@@ -11,9 +11,39 @@ import numpy as np
 from sentence_transformers import SentenceTransformer, util
 import torch
 import textdistance
+from langchain_community.retrievers import BM25Retriever
+
 
 import nltk
 from nltk.corpus import stopwords
+
+CHROMA_DB_DIR = "./chroma_db"   # permanent storage location
+os.makedirs(CHROMA_DB_DIR, exist_ok=True)
+#hybrid retriever
+def hybrid_retrieve(query, semantic_retriever, bm25_retriever):
+    # --- Semantic retriever (Chroma / VectorStore) ---
+    if hasattr(semantic_retriever, "invoke"):
+        semantic_docs = semantic_retriever.invoke(query)
+    else:
+        semantic_docs = semantic_retriever.get_relevant_documents(query)
+
+    # --- Keyword retriever (BM25) ---
+    if hasattr(bm25_retriever, "invoke"):
+        keyword_docs = bm25_retriever.invoke(query)
+    else:
+        keyword_docs = bm25_retriever.get_relevant_documents(query)
+
+    seen = set()
+    docs = []
+
+    for d in semantic_docs + keyword_docs:
+        if d.page_content not in seen:
+            seen.add(d.page_content)
+            docs.append(d)
+
+    return docs
+
+
 
 # Download stopwords if not already present
 try:
@@ -91,6 +121,9 @@ def split_into_chunks(text: str, chunk_size: int = 1000, overlap: int = 200) -> 
         if i + chunk_size >= len(words):
             break
     return chunks
+
+
+
 
 def calculate_semantic_similarity(question: str, context: str) -> Tuple[float, str]:
     """Calculate semantic similarity between question and context using Sentence-BERT.
@@ -491,37 +524,76 @@ with col_upload:
 
                         # Create ChromaDB vector store with persistent storage
                         import tempfile
-                        persist_directory = tempfile.mkdtemp()
-                        vector_store = Chroma.from_texts(
-                            texts=chunks,
-                            embedding=embeddings,
-                            persist_directory=persist_directory
-                        )
+                        #persist_directory = tempfile.mkdtemp()
+                        if os.path.exists(os.path.join(CHROMA_DB_DIR, "chroma.sqlite3")):
+                                vector_store = Chroma(
+                                persist_directory=CHROMA_DB_DIR,
+                                embedding_function=embeddings
+                            )
+                        else:
+                            vector_store = Chroma.from_texts(
+                                texts=chunks,
+                                embedding=embeddings,
+                                persist_directory=CHROMA_DB_DIR
+                            )
+                            vector_store.persist()
+
+                            # --- Create retrievers  ---
+                        semantic_retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+
+                        bm25_retriever = BM25Retriever.from_texts(chunks)
+                        bm25_retriever.k = 5
+
+                        st.session_state.semantic_retriever = semantic_retriever
+                        st.session_state.bm25_retriever = bm25_retriever
+
+                        
 
                         # Create QA chain (only if an LLM is configured)
-                        retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+                        # Hybrid retriever: combine semantic + keyword search
+                        # --- Semantic retriever (existing) ---
+                     # Semantic retriever (Chroma embeddings)
+                        # Semantic retriever (vector similarity)
+                        semantic_retriever = vector_store.as_retriever(
+                            search_kwargs={"k": 3}
+                        )
 
-                        if llm is not None:
-                            if HAS_RETRIEVALQA:
-                                # Use RetrievalQA if available
-                                qa_chain = RetrievalQA.from_chain_type(
-                                    llm=llm,
-                                    retriever=retriever,
-                                    return_source_documents=True
-                                )
-                            else:
-                                # Simple approach: store retriever and llm separately
-                                qa_chain = {
-                                    "retriever": retriever,
-                                    "llm": llm
-                                }
-                        else:
-                            qa_chain = None
+                        # Keyword retriever (BM25)
+                        bm25_retriever = BM25Retriever.from_texts(chunks)
+                        bm25_retriever.k = 3
 
-                        # Store in session state
+                       
+
+
+
+
+
+                        # if llm is not None:
+                        #     if HAS_RETRIEVALQA:
+                        #         # Use RetrievalQA if available
+                        #         qa_chain = RetrievalQA.from_chain_type(
+                        #             llm=llm,
+                        #             return_source_documents=True
+                        #         )
+                        #     else:
+                        #         # Simple approach: store retriever and llm separately
+                        #         docs = hybrid_retrieve(
+                        #                 retrieval_query,
+                        #                 st.session_state.semantic_retriever,
+                        #                 st.session_state.bm25_retriever
+                        #         )
+
+
+                        # else:
+                        #     qa_chain = None
+                        # Store LLM only (NO retrieval here)
+                       # Store objects in session state
                         st.session_state.vector_store = vector_store
-                        st.session_state.qa_chain = qa_chain
+                        st.session_state.qa_chain = {
+                            "llm": llm
+                        }
                         st.session_state.pdf_processed = True
+
                         
                         # Extract and store vocabulary for spell correction
                         vocabulary = extract_vocabulary_from_text(text)
@@ -623,19 +695,35 @@ with col_chat:
                 retrieval_query = corrected_query
                 
                 # Retrieve components
-                qa_data = st.session_state.qa_chain
-                retriever = qa_data["retriever"]
-                llm = qa_data["llm"]
+                # qa_data = st.session_state.qa_chain
+                # retriever = qa_data["retriever"]
+                # llm = qa_data["llm"]
 
-                # Retrieve relevant documents (support modern retriever API)
-                if hasattr(retriever, "get_relevant_documents"):
-                    docs = retriever.get_relevant_documents(retrieval_query)
-                elif hasattr(retriever, "invoke"):
-                    docs = retriever.invoke(retrieval_query)
-                else:
-                    raise AttributeError(
-                        "Retriever object does not support document lookup."
-                    )
+                # # Retrieve relevant documents (support modern retriever API)
+                # # Semantic retriever
+                # semantic_retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+
+                #     # Keyword retriever (BM25)
+                # bm25_retriever = BM25Retriever.from_texts(chunks)
+                # bm25_retriever.k = 5
+
+                # docs = hybrid_retrieve(
+                #     retrieval_query,
+                #     st.session_state.semantic_retriever,
+                #     st.session_state.bm25_retriever
+                # )
+                llm = st.session_state.qa_chain["llm"]  # keep LLM from session
+
+                docs = hybrid_retrieve(
+                    retrieval_query,
+                    st.session_state.semantic_retriever,
+                    st.session_state.bm25_retriever
+                )
+
+
+                            # Merge + deduplicate (by content)
+                
+
 
                 # Build conversational history for context
                 history_text = ""
